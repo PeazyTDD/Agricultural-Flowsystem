@@ -1,8 +1,6 @@
-
 from datetime import datetime, timezone
 import logging
-
-from __init__ import BAD_RANGES, GOOD_RANGES
+import time
 
 
 # config for logging library
@@ -10,6 +8,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
+
+# target ranges
+BAD_RANGES = [(10, 15), (40, 45)]
+GOOD_RANGES = [(0, 9), (20, 29)]
 
 
 def get_timestamp():
@@ -37,23 +39,37 @@ def classify_flow(datapoint):
 
     return "unknown"
 
-"""
-Class: WaterPump
-
-props: 
-  pump_running: bool, 
-  fault_latched: bool
-
-methods:
-  start() -> none
-   
-
-TODO 
-  * Finish class header
-  * For start/stop create Error type which can be ezcalated up to main upon
-    failure to start or stop pump, or latch/unlatch fault
-"""
 class WaterPump:
+    """
+    Class: WaterPump
+
+    Controls the water pump and shuts it down when the flow readings
+    say it should stop.
+
+    props:
+      pump_running: bool, True while the pump is on
+      fault_latched: bool, True after a shutdown; blocks start() until reset
+
+    methods:
+      start() -> None
+        Turns the pump on. Does nothing if a fault is latched.
+        Re-raises any start failure so main() can retry.
+
+      shutdown(reason) -> None
+        Turns the pump off, then latches the fault. Logs reason.
+        Re-raises any stop or latch failure.
+
+      monitor(datapoint) -> None
+        Classifies one flow reading and logs it.
+          "invalid" -> raises TypeError (unrecoverable)
+          "bad"     -> raises ValueError (recoverable, shut pump down)
+          "unknown" -> logs a warning while the pump is running, keeps going
+
+    TODO
+      * For start/stop create Error type which can be escalated up to main upon
+        failure to start or stop pump, or latch/unlatch fault
+    """
+
     def __init__(self):
         self.pump_running = False
         self.fault_latched = False
@@ -71,42 +87,35 @@ class WaterPump:
 
         # TODO: Replace general Exception with the Error types given
         # by the hardware used
-        except Exception as error:
-            print(f"Issue starting pump: {error}")
+        except Exception:
             #Ensure value of pump_running is false if it failed to start
             self.pump_running = False
             # escalate error to main
-            return error
-    
-        #Return true if no errors
-        return True
+            raise
 
     # Shut off the water pump
     def shutdown(self, reason):
         logging.critical("ATTEMPTING PUMP SHUTDOWN: %s", reason)
         try:
             self.pump_running = False
-            print("Pump successfully stopped.")
+            logging.info("Pump successfully stopped.")
         except Exception as error:
-            print(f"Failed to stop pump: {error}")
-            print(f"Pump status: {'running' if self.pump_running else 'not running'}")
-            print("Pump may require manual interfacing")
+            logging.critical("Failed to stop pump: %s", error)
+            logging.critical("Pump status: %s", "running" if self.pump_running else "not running")
+            logging.critical("Pump may require manual interfacing")
             # escalate error to main
-            return error
+            raise
 
         try:
-            print("Attempting to latch fault...")
+            logging.info("Attempting to latch fault...")
             self.fault_latched = True
-            print("Fault latched successfully.")
+            logging.info("Fault latched successfully.")
         except Exception as error:
-            print(f"Failed to latch fault: {error}")
-            print(f"Fault status: {'latched' if self.fault_latched else 'unlatched'}")
-            print("Latch may require manual interfacing.")
+            logging.critical("Failed to latch fault: %s", error)
+            logging.critical("Fault status: %s", "latched" if self.fault_latched else "unlatched")
+            logging.critical("Latch may require manual interfacing.")
             # escalate error to main
-            return error
-
-        return True
-
+            raise
 
     def monitor(self, datapoint):
         status = classify_flow(datapoint)
@@ -119,24 +128,38 @@ class WaterPump:
         )
         
         #Unrecoverable errors, terminate program
-        if status is "invalid":
-            print("Sensor is giving incorrectly typed data.")
-            print("Make sure WaterPump.classify_flow() is being passed correct data.")
+        if status == "invalid":
+            logging.error("Sensor is giving incorrectly typed data.")
+            logging.error("Make sure WaterPump.classify_flow() is being passed correct data.")
             raise TypeError
+        # not fatal, warn and keep running
         elif status == "unknown" and self.pump_running:
-            print("Flow is outside configured ranges.")
-            print("Sensor is giving incorrectly typed data.")
-            print("Make sure WaterPump.classify_flow() is being passed correct data.")
-            raise TypeError
+            logging.warning("Flow is outside configured ranges")
         # recoverable, just turn off pump
-        elif status is "bad":
+        elif status == "bad":
             raise ValueError("Flow is within a bad range.")
         #return status
 
 
 def main():
     pump = WaterPump()
-    pump.start()
+
+    #allow three pump startup retries before terminating
+    retries = 0
+    while retries <= 2:
+        try:
+            pump.start()
+            break
+        except Exception as error:
+            logging.error("Error starting pump: %s", error)
+            logging.info("Retrying...")
+            retries += 1
+            time.sleep(2)
+            continue
+    # runs only if the loop ended without a break (every start attempt failed)
+    else:
+        logging.critical("Maximum retries reached. Shutting down.")
+        return
 
     example_readings = [22, 23, 12, 24, 42]
 
@@ -145,7 +168,7 @@ def main():
         try:
             pump.monitor(datapoint)
         except TypeError:
-            print("Attempting to close fault latch, and shut down pump.")
+            logging.warning("Attempting to close fault latch, and shut down pump.")
             pump.shutdown("Bug in program.")
         except ValueError as error:
             pump.shutdown(error)
